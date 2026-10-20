@@ -3,6 +3,7 @@ import html
 import os
 import secrets
 import hmac
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from datetime import datetime, timezone
 from urllib.parse import quote
 from fastapi import FastAPI, Form, HTTPException, Request
@@ -24,7 +25,7 @@ class Registration(Base):
     name = Column(String(90), nullable=False)
     account = Column(String(20), nullable=False)
     server = Column(String(100), nullable=False)
-    lot = Column(String(8), nullable=False)
+    lot = Column(String(8), nullable=False, default="")  # legacy column retained for existing SQLite DBs; no fixed lot
     status = Column(String(24), nullable=False, default='Pending Approval')
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 Base.metadata.create_all(engine)
@@ -58,18 +59,18 @@ def same_origin(request):
 
 @app.get('/',response_class=HTMLResponse)
 def index():
-    return page('Client Registration','''<div class="card"><h1>Client Registration</h1><p>Submit your MT5 <b>demo</b> account information for review. <b>No password is required.</b></p><form method="post" action="/register"><label>Your name</label><input name="name" maxlength="90" required><label>MT5 Demo Account ID</label><input name="account" inputmode="numeric" pattern="[0-9]{4,15}" required maxlength="15"><label>Broker server</label><input name="server" maxlength="100" required><label>Fixed lot (preference only)</label><select name="lot"><option>0.01</option><option>0.02</option><option>0.05</option><option>0.10</option></select><button type="submit">Submit for Approval</button></form><p class="note">Registration and approval do not activate trading. Never share your MT5 password here. Trading carries risk.</p></div>''')
+    return page('Client Registration','''<div class="card"><h1>Client Registration</h1><p>Submit your MT5 <b>demo</b> account information for review. <b>No password is required.</b></p><form method="post" action="/register"><label>Your name</label><input name="name" maxlength="90" required><label>MT5 Demo Account ID</label><input name="account" inputmode="numeric" pattern="[0-9]{4,15}" required maxlength="15"><label>Broker server</label><input name="server" maxlength="100" required><p class="note"><b>Automatic lot sizing:</b> Master trade lot × (Client balance ÷ Master balance). The trading engine will need verified live balances and broker lot limits. No fixed lot selection.</p><button type="submit">Submit for Approval</button></form><p class="note">Registration and approval do not activate trading. Never share your MT5 password here. Trading carries risk.</p></div>''')
 
 @app.post('/register')
-def register(name:str=Form(...),account:str=Form(...),server:str=Form(...),lot:str=Form('0.01')):
+def register(name:str=Form(...),account:str=Form(...),server:str=Form(...)):
     name=name.strip();server=server.strip();account=account.strip()
-    if not (1<=len(name)<=90 and 1<=len(server)<=100 and account.isascii() and account.isdigit() and 4<=len(account)<=15 and lot in ['0.01','0.02','0.05','0.10']):
+    if not (1<=len(name)<=90 and 1<=len(server)<=100 and account.isascii() and account.isdigit() and 4<=len(account)<=15):
         raise HTTPException(422,'Invalid registration details')
     token=secrets.token_urlsafe(32)
     with Session(engine) as db:
         count=db.scalar(select(func.count()).select_from(Registration))
         if count>=25: raise HTTPException(409,'Registration capacity reached (25)')
-        db.add(Registration(token=token,name=name,account=account,server=server,lot=lot))
+        db.add(Registration(token=token,name=name,account=account,server=server,lot=""))
         db.commit()
     return RedirectResponse('/status/'+quote(token),status_code=303)
 
@@ -86,19 +87,10 @@ def admin(request:Request):
     admin_auth(request)
     with Session(engine) as db:
         rows=db.scalars(select(Registration).order_by(Registration.id.desc())).all()
-        cells=''.join(f'<tr><td>{r.id}</td><td>{safe(r.name)}</td><td>{safe(r.account)}</td><td>{safe(r.server)}</td><td>{safe(r.lot)}</td><td>{safe(r.status)}</td><td><div class="actions"><form method="post" action="/admin/{r.id}/approve"><button>Approve</button></form><form method="post" action="/admin/{r.id}/reject"><button class="danger">Reject</button></form></div></td></tr>' for r in rows)
-    return page('Admin Approval',f'<div class="card"><h1>Admin Approval</h1><p>Registrations: {len(rows)} / 25. Approving is administrative only; it never starts trades.</p><div class="scroll"><table><tr><th>#</th><th>Name</th><th>MT5 ID</th><th>Server</th><th>Lot</th><th>Status</th><th>Actions</th></tr>{cells}</table></div><p class="note">Do not use real trading credentials. Admin authentication uses HTTPS Basic Auth; production requires additional hardening and abuse protection.</p></div>')
+        cells=''.join(f'<tr><td>{r.id}</td><td>{safe(r.name)}</td><td>{safe(r.account)}</td><td>{safe(r.server)}</td><td>{safe(r.status)}</td><td><div class="actions"><form method="post" action="/admin/{r.id}/approve"><button>Approve</button></form><form method="post" action="/admin/{r.id}/reject"><button class="danger">Reject</button></form></div></td></tr>' for r in rows)
+    return page('Admin Approval',f'<div class="card"><h1>Admin Approval</h1><p>Registrations: {len(rows)} / 25. Approving is administrative only; it never starts trades. Lot mode: balance ratio (planned).</p><div class="scroll"><table><tr><th>#</th><th>Name</th><th>MT5 ID</th><th>Server</th><th>Status</th><th>Actions</th></tr>{cells}</table></div><p><a href="/admin/lot-preview">Preview automatic balance-ratio lots</a></p><p class="note">Do not use real trading credentials. Admin authentication uses HTTPS Basic Auth; production requires additional hardening and abuse protection.</p></div>')
 
 @app.post('/admin/{registration_id}/{action}')
 def update(request:Request,registration_id:int,action:str):
     admin_auth(request);same_origin(request)
     if action not in ['approve','reject']: raise HTTPException(404)
-    with Session(engine) as db:
-        reg=db.get(Registration,registration_id)
-        if not reg: raise HTTPException(404)
-        reg.status='Approved — Connection Required' if action=='approve' else 'Rejected'
-        db.commit()
-    return RedirectResponse('/admin',status_code=303)
-
-@app.get('/health')
-def health(): return {'ok':True,'product':'BIG BULL COPY Registration','copy_trading_active':False}
